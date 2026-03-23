@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance
 from torch.utils.data import Dataset
 
 KEY_ORDER = ("w", "a", "s", "d")
@@ -97,9 +97,19 @@ def split_records(
 
 
 class DrivingDataset(Dataset[dict[str, Any]]):
-    def __init__(self, records: list[SampleRecord], image_size: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        records: list[SampleRecord],
+        image_size: tuple[int, int],
+        augment: bool = False,
+        jitter_strength: float = 0.0,
+        noise_std: float = 0.0,
+    ) -> None:
         self.records = records
         self.image_size = image_size  # (width, height)
+        self.augment = augment
+        self.jitter_strength = max(0.0, float(jitter_strength))
+        self.noise_std = max(0.0, float(noise_std))
 
     def __len__(self) -> int:
         return len(self.records)
@@ -109,7 +119,14 @@ class DrivingDataset(Dataset[dict[str, Any]]):
         with Image.open(record.frame_path) as img:
             img = img.convert("RGB")
             img = img.resize(self.image_size, Image.BILINEAR)
+            if self.augment:
+                img = self._apply_augmentation(img)
             image_np = np.asarray(img, dtype=np.float32) / 255.0
+            if self.augment and self.noise_std > 0:
+                noise = np.random.normal(loc=0.0, scale=self.noise_std, size=image_np.shape).astype(
+                    np.float32
+                )
+                image_np = np.clip(image_np + noise, 0.0, 1.0)
 
         image_tensor = torch.from_numpy(image_np).permute(2, 0, 1)
         image_tensor = (image_tensor - 0.5) / 0.5
@@ -125,3 +142,15 @@ class DrivingDataset(Dataset[dict[str, Any]]):
             "session_name": record.session_name,
         }
 
+    def _apply_augmentation(self, image: Image.Image) -> Image.Image:
+        if self.jitter_strength <= 0:
+            return image
+        low = max(0.4, 1.0 - self.jitter_strength)
+        high = 1.0 + self.jitter_strength
+        brightness = random.uniform(low, high)
+        contrast = random.uniform(low, high)
+        color = random.uniform(low, high)
+        image = ImageEnhance.Brightness(image).enhance(brightness)
+        image = ImageEnhance.Contrast(image).enhance(contrast)
+        image = ImageEnhance.Color(image).enhance(color)
+        return image

@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace, checkpoint_config: dict[str, object]) -> PlayConfig:
-    image_width = args.image_width or int(checkpoint_config.get("image_width", 256))
-    image_height = args.image_height or int(checkpoint_config.get("image_height", 144))
+    image_width = args.image_width or int(checkpoint_config.get("image_width", 512))
+    image_height = args.image_height or int(checkpoint_config.get("image_height", 288))
     mouse_scale = args.mouse_scale or float(checkpoint_config.get("mouse_scale", 30.0))
     return PlayConfig(
         checkpoint=args.checkpoint,
@@ -78,8 +78,9 @@ class ImitationDriver:
 
         payload = torch.load(cfg.checkpoint, map_location="cpu")
         self.key_order = [str(k).lower() for k in payload.get("key_order", ["w", "a", "s", "d"])]
+        self.model_size = str(payload.get("model_size") or payload.get("config", {}).get("model_size", "base"))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = DrivingNet().to(self.device)
+        self.model = DrivingNet(model_size=self.model_size).to(self.device)
         self.model.load_state_dict(payload["model_state_dict"])
         self.model.eval()
 
@@ -207,6 +208,7 @@ def main() -> None:
     print("[INFO] Fase 3 - Conduccion autonoma por imitation learning")
     print(f"[INFO] Checkpoint: {cfg.checkpoint}")
     print(f"[INFO] Device: {driver.device}")
+    print(f"[INFO] Model size: {driver.model_size}")
     print(f"[INFO] Input: {cfg.image_width}x{cfg.image_height} | mouse_scale={cfg.mouse_scale}")
     print("[INFO] Hotkeys globales:")
     print("       Ctrl+8 -> iniciar autopilot")
