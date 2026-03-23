@@ -1,5 +1,7 @@
 import argparse
 import json
+import math
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +60,15 @@ def batch_metrics(
     return {"key_acc": key_acc, "mouse_mae": mouse_mae}
 
 
+def format_duration(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "??:??:??"
+    total_seconds = int(round(seconds))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def run_epoch(
     model: DrivingNet,
     dataloader: DataLoader,
@@ -66,18 +77,23 @@ def run_epoch(
     bce_loss: nn.Module,
     mse_loss: nn.Module,
     mouse_loss_weight: float,
+    progress_prefix: str,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
+    total_steps = len(dataloader)
+    if total_steps == 0:
+        raise RuntimeError("Dataloader vacio, no se pudo procesar ninguna iteracion.")
 
     total_loss = 0.0
     total_key_loss = 0.0
     total_mouse_loss = 0.0
     total_key_acc = 0.0
     total_mouse_mae = 0.0
-    steps = 0
+    epoch_start = time.perf_counter()
+    update_every = max(1, total_steps // 20)
 
-    for batch in dataloader:
+    for step_idx, batch in enumerate(dataloader, start=1):
         images = batch["image"].to(device)
         key_target = batch["key_target"].to(device)
         mouse_target = batch["mouse_target"].to(device)
@@ -101,17 +117,28 @@ def run_epoch(
         total_mouse_loss += mouse_loss.item()
         total_key_acc += metrics["key_acc"]
         total_mouse_mae += metrics["mouse_mae"]
-        steps += 1
+        if step_idx == 1 or step_idx % update_every == 0 or step_idx == total_steps:
+            elapsed = time.perf_counter() - epoch_start
+            avg_step_time = elapsed / step_idx
+            eta = avg_step_time * (total_steps - step_idx)
+            pct = (100.0 * step_idx) / total_steps
+            print(
+                f"\r{progress_prefix} {pct:6.2f}% ({step_idx}/{total_steps}) "
+                f"ETA epoca: {format_duration(eta)}",
+                end="",
+                flush=True,
+            )
+    print()
 
-    if steps == 0:
-        raise RuntimeError("Dataloader vacio, no se pudo procesar ninguna iteracion.")
+    epoch_duration = time.perf_counter() - epoch_start
 
     return {
-        "loss": total_loss / steps,
-        "key_loss": total_key_loss / steps,
-        "mouse_loss": total_mouse_loss / steps,
-        "key_acc": total_key_acc / steps,
-        "mouse_mae": total_mouse_mae / steps,
+        "loss": total_loss / total_steps,
+        "key_loss": total_key_loss / total_steps,
+        "mouse_loss": total_mouse_loss / total_steps,
+        "key_acc": total_key_acc / total_steps,
+        "mouse_mae": total_mouse_mae / total_steps,
+        "duration_sec": epoch_duration,
     }
 
 
@@ -165,6 +192,7 @@ def main() -> None:
 
     history: list[dict[str, float | int]] = []
     best_val_loss = float("inf")
+    training_start = time.perf_counter()
 
     print(f"[INFO] Entrenando en device: {device}")
     for epoch in range(1, args.epochs + 1):
@@ -176,6 +204,7 @@ def main() -> None:
             bce_loss=bce_loss,
             mse_loss=mse_loss,
             mouse_loss_weight=args.mouse_loss_weight,
+            progress_prefix=f"[TRAIN {epoch:02d}/{args.epochs:02d}]",
         )
         with torch.no_grad():
             val_metrics = run_epoch(
@@ -186,6 +215,7 @@ def main() -> None:
                 bce_loss=bce_loss,
                 mse_loss=mse_loss,
                 mouse_loss_weight=args.mouse_loss_weight,
+                progress_prefix=f"[VAL   {epoch:02d}/{args.epochs:02d}]",
             )
 
         row = {
@@ -200,8 +230,15 @@ def main() -> None:
             "val_mouse_loss": val_metrics["mouse_loss"],
             "val_key_acc": val_metrics["key_acc"],
             "val_mouse_mae": val_metrics["mouse_mae"],
+            "epoch_train_sec": train_metrics["duration_sec"],
+            "epoch_val_sec": val_metrics["duration_sec"],
         }
         history.append(row)
+
+        elapsed_total = time.perf_counter() - training_start
+        avg_epoch_sec = elapsed_total / epoch
+        eta_total = avg_epoch_sec * (args.epochs - epoch)
+        estimated_total = avg_epoch_sec * args.epochs
 
         print(
             f"[EPOCH {epoch:02d}] "
@@ -210,7 +247,13 @@ def main() -> None:
             f"train_key_acc={row['train_key_acc']:.3f} "
             f"val_key_acc={row['val_key_acc']:.3f} "
             f"train_mouse_mae={row['train_mouse_mae']:.3f} "
-            f"val_mouse_mae={row['val_mouse_mae']:.3f}"
+            f"val_mouse_mae={row['val_mouse_mae']:.3f} "
+            f"tiempo_epoca={format_duration(row['epoch_train_sec'] + row['epoch_val_sec'])}"
+        )
+        print(
+            f"[TIME] transcurrido={format_duration(elapsed_total)} "
+            f"restante_estimado={format_duration(eta_total)} "
+            f"total_estimado={format_duration(estimated_total)}"
         )
 
         checkpoint_payload = {
