@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import math
 import time
@@ -9,9 +9,16 @@ import numpy as np
 import torch
 from torch import nn
 from torch.cuda.amp import GradScaler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from training.dataset import KEY_ORDER, DrivingDataset, load_records, split_records
+from training.dataset import (
+    KEY_ORDER,
+    MODE_ORDER,
+    DrivingDataset,
+    load_records,
+    smooth_mouse_targets,
+    split_records,
+)
 from training.model import DrivingNet
 
 
@@ -19,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train imitation model for GTA SA driving.")
     parser.add_argument("--captures-dir", type=Path, default=Path("captures"))
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -28,11 +35,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-width", type=int, default=512)
     parser.add_argument("--image-height", type=int, default=288)
     parser.add_argument("--model-size", type=str, default="plus", choices=["base", "plus", "xl"])
+    parser.add_argument("--seq-len", type=int, default=4, help="Cantidad de frames por sample temporal.")
+    parser.add_argument("--frame-stride", type=int, default=1, help="Salto entre frames en la secuencia.")
     parser.add_argument("--mouse-scale", type=float, default=30.0)
-    parser.add_argument("--mouse-loss-weight", type=float, default=0.35)
+    parser.add_argument("--mouse-loss-weight", type=float, default=0.40)
+    parser.add_argument("--mouse-x-loss-weight", type=float, default=1.15)
+    parser.add_argument("--mouse-y-loss-weight", type=float, default=1.00)
+    parser.add_argument("--mode-loss-weight", type=float, default=0.25)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--huber-delta", type=float, default=0.12)
     parser.add_argument(
         "--max-pos-weight",
         type=float,
@@ -51,11 +64,36 @@ def parse_args() -> argparse.Namespace:
         default=0.01,
         help="Gaussian noise std added to train images in [0, 1] space.",
     )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="segment",
+        choices=["random", "session", "segment"],
+        help="Split de train/val. segment evita leakage entre frames cercanos.",
+    )
+    parser.add_argument(
+        "--segment-length",
+        type=int,
+        default=240,
+        help="Longitud de segmento para split_mode=segment.",
+    )
+    parser.add_argument("--mouse-smooth-window", type=int, default=5)
+    parser.add_argument("--mouse-clean-deadzone", type=float, default=0.015)
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=10,
+        help="Corta entrenamiento si val_loss no mejora por N epocas (<=0 desactiva).",
+    )
     parser.add_argument("--balance-keys", dest="balance_keys", action="store_true")
     parser.add_argument("--no-balance-keys", dest="balance_keys", action="store_false")
+    parser.add_argument("--balance-modes", dest="balance_modes", action="store_true")
+    parser.add_argument("--no-balance-modes", dest="balance_modes", action="store_false")
+    parser.add_argument("--weighted-sampler", dest="weighted_sampler", action="store_true")
+    parser.add_argument("--no-weighted-sampler", dest="weighted_sampler", action="store_false")
     parser.add_argument("--use-amp", dest="use_amp", action="store_true")
     parser.add_argument("--no-amp", dest="use_amp", action="store_false")
-    parser.set_defaults(balance_keys=True, use_amp=True)
+    parser.set_defaults(balance_keys=True, balance_modes=True, weighted_sampler=True, use_amp=True)
     return parser.parse_args()
 
 
@@ -80,12 +118,19 @@ def batch_metrics(
     key_target: torch.Tensor,
     mouse_pred: torch.Tensor,
     mouse_target: torch.Tensor,
+    mode_logits: torch.Tensor | None,
+    mode_target: torch.Tensor,
 ) -> dict[str, float]:
     with torch.no_grad():
         key_pred = (torch.sigmoid(key_logits) > 0.5).float()
         key_acc = (key_pred == key_target).float().mean().item()
         mouse_mae = torch.abs(mouse_pred - mouse_target).mean().item()
-    return {"key_acc": key_acc, "mouse_mae": mouse_mae}
+        if mode_logits is not None:
+            mode_pred = torch.argmax(mode_logits, dim=1)
+            mode_acc = (mode_pred == mode_target).float().mean().item()
+        else:
+            mode_acc = 0.0
+    return {"key_acc": key_acc, "mouse_mae": mouse_mae, "mode_acc": mode_acc}
 
 
 def format_duration(seconds: float) -> str:
@@ -104,8 +149,6 @@ def compute_key_pos_weight(
     pos = targets.sum(axis=0)
     neg = float(len(records)) - pos
     raw = neg / np.clip(pos, 1.0, None)
-    # Keep minimum at 1.0 so frequent keys (e.g. W) are not downweighted.
-    # Cap rare keys (e.g. S) to prevent extreme reverse bias.
     clipped = np.clip(raw, 1.0, max(1.0, float(max_pos_weight))).astype(np.float32)
     ratios = {
         key_name: float(pos_i / max(1.0, float(len(records))))
@@ -115,14 +158,58 @@ def compute_key_pos_weight(
     return pos_weight, ratios
 
 
+def derive_mode_label(record) -> int:
+    if record.key_target[2] > 0.5:
+        return MODE_ORDER.index("reverse")
+    abs_steer = float(abs(record.mouse_target[0]))
+    if abs_steer >= 0.40:
+        return MODE_ORDER.index("correction")
+    if abs_steer >= 0.22 or record.key_target[1] > 0.5 or record.key_target[3] > 0.5:
+        return MODE_ORDER.index("turn")
+    return MODE_ORDER.index("normal")
+
+
+def compute_mode_class_weights(records: list, device: torch.device) -> tuple[torch.Tensor, dict[str, float]]:
+    labels = np.array([derive_mode_label(r) for r in records], dtype=np.int64)
+    counts = np.bincount(labels, minlength=len(MODE_ORDER)).astype(np.float32)
+    total = float(max(1, counts.sum()))
+    ratios = {mode: float(counts[i] / total) for i, mode in enumerate(MODE_ORDER)}
+    inv = total / np.clip(counts, 1.0, None)
+    inv = inv / inv.mean()
+    weights = torch.tensor(inv, dtype=torch.float32, device=device)
+    return weights, ratios
+
+
+def build_sample_weights(records: list) -> torch.DoubleTensor:
+    weights = []
+    for record in records:
+        w = 1.0
+        abs_steer = float(abs(record.mouse_target[0]))
+        if record.key_target[2] > 0.5:
+            w += 3.0
+        if abs_steer >= 0.22:
+            w += 1.6
+        if abs_steer >= 0.40:
+            w += 1.8
+        if (record.key_target[1] > 0.5 or record.key_target[3] > 0.5) and abs_steer >= 0.20:
+            w += 1.2
+        weights.append(w)
+    weights_np = np.array(weights, dtype=np.float64)
+    weights_np /= max(1e-8, weights_np.mean())
+    return torch.from_numpy(weights_np)
+
+
 def run_epoch(
     model: DrivingNet,
     dataloader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     bce_loss: nn.Module,
-    mse_loss: nn.Module,
+    huber_loss: nn.Module,
+    mode_loss_fn: nn.Module,
     mouse_loss_weight: float,
+    mode_loss_weight: float,
+    mouse_axis_weights: torch.Tensor,
     progress_prefix: str,
     scaler: GradScaler | None,
     use_amp: bool,
@@ -137,8 +224,10 @@ def run_epoch(
     total_loss = 0.0
     total_key_loss = 0.0
     total_mouse_loss = 0.0
+    total_mode_loss = 0.0
     total_key_acc = 0.0
     total_mouse_mae = 0.0
+    total_mode_acc = 0.0
     epoch_start = time.perf_counter()
     update_every = max(1, total_steps // 20)
 
@@ -146,6 +235,7 @@ def run_epoch(
         images = batch["image"].to(device, non_blocking=True)
         key_target = batch["key_target"].to(device, non_blocking=True)
         mouse_target = batch["mouse_target"].to(device, non_blocking=True)
+        mode_target = batch["mode_target"].to(device, non_blocking=True)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -155,10 +245,21 @@ def run_epoch(
             dtype=torch.float16,
             enabled=bool(use_amp and device.type == "cuda"),
         ):
-            key_logits, mouse_pred = model(images)
+            outputs = model(images)
+            if isinstance(outputs, tuple) and len(outputs) == 3:
+                key_logits, mouse_pred, mode_logits = outputs
+            else:
+                key_logits, mouse_pred = outputs
+                mode_logits = None
+
             key_loss = bce_loss(key_logits, key_target)
-            mouse_loss = mse_loss(mouse_pred, mouse_target)
-            loss = key_loss + mouse_loss_weight * mouse_loss
+            mouse_raw = huber_loss(mouse_pred, mouse_target)
+            mouse_loss = (mouse_raw * mouse_axis_weights).mean()
+            if mode_logits is not None:
+                mode_loss = mode_loss_fn(mode_logits, mode_target)
+            else:
+                mode_loss = torch.zeros((), device=device)
+            loss = key_loss + mouse_loss_weight * mouse_loss + mode_loss_weight * mode_loss
 
         if is_train:
             if scaler is not None and scaler.is_enabled():
@@ -174,13 +275,15 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-        metrics = batch_metrics(key_logits, key_target, mouse_pred, mouse_target)
+        metrics = batch_metrics(key_logits, key_target, mouse_pred, mouse_target, mode_logits, mode_target)
 
         total_loss += loss.item()
         total_key_loss += key_loss.item()
         total_mouse_loss += mouse_loss.item()
+        total_mode_loss += mode_loss.item()
         total_key_acc += metrics["key_acc"]
         total_mouse_mae += metrics["mouse_mae"]
+        total_mode_acc += metrics["mode_acc"]
         if step_idx == 1 or step_idx % update_every == 0 or step_idx == total_steps:
             elapsed = time.perf_counter() - epoch_start
             avg_step_time = elapsed / step_idx
@@ -200,8 +303,10 @@ def run_epoch(
         "loss": total_loss / total_steps,
         "key_loss": total_key_loss / total_steps,
         "mouse_loss": total_mouse_loss / total_steps,
+        "mode_loss": total_mode_loss / total_steps,
         "key_acc": total_key_acc / total_steps,
         "mouse_mae": total_mouse_mae / total_steps,
+        "mode_acc": total_mode_acc / total_steps,
         "duration_sec": epoch_duration,
     }
 
@@ -217,7 +322,23 @@ def main() -> None:
 
     print("[INFO] Cargando dataset...")
     records = load_records(args.captures_dir, mouse_scale=args.mouse_scale)
-    train_records, val_records = split_records(records, val_ratio=args.val_ratio, seed=args.seed)
+    train_records, val_records = split_records(
+        records,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        split_mode=args.split_mode,
+        segment_length=args.segment_length,
+    )
+    train_records = smooth_mouse_targets(
+        train_records,
+        window_size=max(1, args.mouse_smooth_window),
+        deadzone=max(0.0, args.mouse_clean_deadzone),
+    )
+    val_records = smooth_mouse_targets(
+        val_records,
+        window_size=max(1, args.mouse_smooth_window),
+        deadzone=max(0.0, args.mouse_clean_deadzone),
+    )
 
     print(f"[INFO] Samples totales: {len(records)}")
     print(f"[INFO] Train: {len(train_records)} | Val: {len(val_records)}")
@@ -225,6 +346,8 @@ def main() -> None:
     train_ds = DrivingDataset(
         train_records,
         image_size=(args.image_width, args.image_height),
+        seq_len=args.seq_len,
+        frame_stride=args.frame_stride,
         augment=True,
         jitter_strength=args.train_jitter_strength,
         noise_std=args.train_noise_std,
@@ -232,6 +355,8 @@ def main() -> None:
     val_ds = DrivingDataset(
         val_records,
         image_size=(args.image_width, args.image_height),
+        seq_len=args.seq_len,
+        frame_stride=args.frame_stride,
         augment=False,
         jitter_strength=0.0,
         noise_std=0.0,
@@ -239,10 +364,24 @@ def main() -> None:
 
     using_cuda = torch.cuda.is_available()
     persistent_workers = args.num_workers > 0
+    train_sampler = None
+    if args.weighted_sampler:
+        sample_weights = build_sample_weights(train_ds.get_endpoint_records())
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        print(
+            "[INFO] Weighted sampler activo "
+            f"(w min={float(sample_weights.min()):.2f}, max={float(sample_weights.max()):.2f})."
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=using_cuda,
         persistent_workers=persistent_workers,
@@ -257,7 +396,7 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if using_cuda else "cpu")
-    model = DrivingNet(model_size=args.model_size).to(device)
+    model = DrivingNet(model_size=args.model_size, seq_len=args.seq_len).to(device)
     model_param_count = sum(p.numel() for p in model.parameters())
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -267,34 +406,58 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr
     )
+
+    train_endpoints = train_ds.get_endpoint_records()
     key_pos_weight = None
     key_ratios = {}
     if args.balance_keys:
         key_pos_weight, key_ratios = compute_key_pos_weight(
-            train_records, device=device, max_pos_weight=args.max_pos_weight
+            train_endpoints, device=device, max_pos_weight=args.max_pos_weight
         )
         print("[INFO] Balanceo de teclas activo (pos_weight BCE):")
         print("       " + ", ".join(f"{k}={v:.3f}" for k, v in zip(KEY_ORDER, key_pos_weight.tolist())))
     else:
-        targets = np.stack([sample.key_target for sample in train_records], axis=0)
+        targets = np.stack([sample.key_target for sample in train_endpoints], axis=0)
         key_ratios = {
-            key_name: float(pos / max(1, len(train_records)))
+            key_name: float(pos / max(1, len(train_endpoints)))
             for key_name, pos in zip(KEY_ORDER, targets.sum(axis=0), strict=False)
         }
     print("[INFO] Distribucion de teclas train:")
     print("       " + ", ".join(f"{k}={key_ratios[k]:.3f}" for k in KEY_ORDER))
 
+    mode_weight = None
+    mode_ratios = {}
+    if args.balance_modes:
+        mode_weight, mode_ratios = compute_mode_class_weights(train_endpoints, device=device)
+        print("[INFO] Balanceo de modo activo (CrossEntropy weights):")
+        print("       " + ", ".join(f"{m}={w:.3f}" for m, w in zip(MODE_ORDER, mode_weight.tolist())))
+    else:
+        labels = np.array([derive_mode_label(r) for r in train_endpoints], dtype=np.int64)
+        counts = np.bincount(labels, minlength=len(MODE_ORDER)).astype(np.float32)
+        total = float(max(1, counts.sum()))
+        mode_ratios = {mode: float(counts[i] / total) for i, mode in enumerate(MODE_ORDER)}
+    print("[INFO] Distribucion de modos train:")
+    print("       " + ", ".join(f"{m}={mode_ratios[m]:.3f}" for m in MODE_ORDER))
+
     bce_loss = nn.BCEWithLogitsLoss(pos_weight=key_pos_weight)
-    mse_loss = nn.MSELoss()
+    huber_loss = nn.SmoothL1Loss(beta=max(1e-3, args.huber_delta), reduction="none")
+    mode_loss_fn = nn.CrossEntropyLoss(weight=mode_weight)
+    mouse_axis_weights = torch.tensor(
+        [max(0.05, args.mouse_x_loss_weight), max(0.05, args.mouse_y_loss_weight)],
+        dtype=torch.float32,
+        device=device,
+    )
     scaler = GradScaler(enabled=bool(args.use_amp and device.type == "cuda"))
 
     history: list[dict[str, float | int]] = []
     best_val_loss = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
     training_start = time.perf_counter()
 
     print(
         f"[INFO] Entrenando en device: {device} | amp={scaler.is_enabled()} | "
-        f"model_size={args.model_size} | params={model_param_count:,}"
+        f"model_size={args.model_size} | seq_len={args.seq_len} | params={model_param_count:,}"
     )
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
@@ -303,8 +466,11 @@ def main() -> None:
             device=device,
             optimizer=optimizer,
             bce_loss=bce_loss,
-            mse_loss=mse_loss,
+            huber_loss=huber_loss,
+            mode_loss_fn=mode_loss_fn,
             mouse_loss_weight=args.mouse_loss_weight,
+            mode_loss_weight=args.mode_loss_weight,
+            mouse_axis_weights=mouse_axis_weights,
             progress_prefix=f"[TRAIN {epoch:02d}/{args.epochs:02d}]",
             scaler=scaler,
             use_amp=args.use_amp,
@@ -317,8 +483,11 @@ def main() -> None:
                 device=device,
                 optimizer=None,
                 bce_loss=bce_loss,
-                mse_loss=mse_loss,
+                huber_loss=huber_loss,
+                mode_loss_fn=mode_loss_fn,
                 mouse_loss_weight=args.mouse_loss_weight,
+                mode_loss_weight=args.mode_loss_weight,
+                mouse_axis_weights=mouse_axis_weights,
                 progress_prefix=f"[VAL   {epoch:02d}/{args.epochs:02d}]",
                 scaler=None,
                 use_amp=args.use_amp,
@@ -331,13 +500,17 @@ def main() -> None:
             "train_loss": train_metrics["loss"],
             "train_key_loss": train_metrics["key_loss"],
             "train_mouse_loss": train_metrics["mouse_loss"],
+            "train_mode_loss": train_metrics["mode_loss"],
             "train_key_acc": train_metrics["key_acc"],
             "train_mouse_mae": train_metrics["mouse_mae"],
+            "train_mode_acc": train_metrics["mode_acc"],
             "val_loss": val_metrics["loss"],
             "val_key_loss": val_metrics["key_loss"],
             "val_mouse_loss": val_metrics["mouse_loss"],
+            "val_mode_loss": val_metrics["mode_loss"],
             "val_key_acc": val_metrics["key_acc"],
             "val_mouse_mae": val_metrics["mouse_mae"],
+            "val_mode_acc": val_metrics["mode_acc"],
             "epoch_train_sec": train_metrics["duration_sec"],
             "epoch_val_sec": val_metrics["duration_sec"],
             "lr": current_lr,
@@ -355,6 +528,8 @@ def main() -> None:
             f"val_loss={row['val_loss']:.4f} "
             f"train_key_acc={row['train_key_acc']:.3f} "
             f"val_key_acc={row['val_key_acc']:.3f} "
+            f"train_mode_acc={row['train_mode_acc']:.3f} "
+            f"val_mode_acc={row['val_mode_acc']:.3f} "
             f"train_mouse_mae={row['train_mouse_mae']:.3f} "
             f"val_mouse_mae={row['val_mouse_mae']:.3f} "
             f"lr={row['lr']:.6f} "
@@ -372,18 +547,34 @@ def main() -> None:
             "epoch": epoch,
             "val_loss": row["val_loss"],
             "key_order": ["w", "a", "s", "d"],
+            "mode_order": list(MODE_ORDER),
             "key_pos_weight": key_pos_weight.detach().cpu().tolist() if key_pos_weight is not None else None,
+            "mode_weight": mode_weight.detach().cpu().tolist() if mode_weight is not None else None,
             "key_ratios": key_ratios,
+            "mode_ratios": mode_ratios,
             "model_size": args.model_size,
+            "seq_len": args.seq_len,
+            "frame_stride": args.frame_stride,
             "model_param_count": model_param_count,
         }
         torch.save(checkpoint_payload, run_dir / "last.pt")
 
         if row["val_loss"] < best_val_loss:
             best_val_loss = row["val_loss"]
+            best_epoch = epoch
+            stale_epochs = 0
             torch.save(checkpoint_payload, run_dir / "best.pt")
+        else:
+            stale_epochs += 1
 
         scheduler.step()
+
+        if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+            print(
+                f"[EARLY STOP] Sin mejora en val_loss por {stale_epochs} epocas. "
+                f"Mejor epoca={best_epoch} (val_loss={best_val_loss:.4f})."
+            )
+            break
 
     summary = {
         "config": config,
@@ -391,8 +582,12 @@ def main() -> None:
         "total_samples": len(records),
         "train_samples": len(train_records),
         "val_samples": len(val_records),
+        "train_sequences": len(train_ds),
+        "val_sequences": len(val_ds),
         "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
         "key_ratios": key_ratios,
+        "mode_ratios": mode_ratios,
         "history": history,
     }
     (run_dir / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
