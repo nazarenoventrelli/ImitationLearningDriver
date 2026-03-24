@@ -27,12 +27,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-width", type=int, default=512)
     parser.add_argument("--image-height", type=int, default=288)
-    parser.add_argument("--model-size", type=str, default="plus", choices=["base", "plus"])
+    parser.add_argument("--model-size", type=str, default="plus", choices=["base", "plus", "xl"])
     parser.add_argument("--mouse-scale", type=float, default=30.0)
     parser.add_argument("--mouse-loss-weight", type=float, default=0.35)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--max-pos-weight",
+        type=float,
+        default=6.0,
+        help="Upper cap for BCE pos_weight to avoid over-amplifying rare keys like reverse.",
+    )
     parser.add_argument(
         "--train-jitter-strength",
         type=float,
@@ -91,12 +97,16 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def compute_key_pos_weight(records: list, device: torch.device) -> tuple[torch.Tensor, dict[str, float]]:
+def compute_key_pos_weight(
+    records: list, device: torch.device, max_pos_weight: float
+) -> tuple[torch.Tensor, dict[str, float]]:
     targets = np.stack([sample.key_target for sample in records], axis=0)
     pos = targets.sum(axis=0)
     neg = float(len(records)) - pos
     raw = neg / np.clip(pos, 1.0, None)
-    clipped = np.clip(raw, 0.5, 10.0).astype(np.float32)
+    # Keep minimum at 1.0 so frequent keys (e.g. W) are not downweighted.
+    # Cap rare keys (e.g. S) to prevent extreme reverse bias.
+    clipped = np.clip(raw, 1.0, max(1.0, float(max_pos_weight))).astype(np.float32)
     ratios = {
         key_name: float(pos_i / max(1.0, float(len(records))))
         for key_name, pos_i in zip(KEY_ORDER, pos, strict=False)
@@ -260,7 +270,9 @@ def main() -> None:
     key_pos_weight = None
     key_ratios = {}
     if args.balance_keys:
-        key_pos_weight, key_ratios = compute_key_pos_weight(train_records, device=device)
+        key_pos_weight, key_ratios = compute_key_pos_weight(
+            train_records, device=device, max_pos_weight=args.max_pos_weight
+        )
         print("[INFO] Balanceo de teclas activo (pos_weight BCE):")
         print("       " + ", ".join(f"{k}={v:.3f}" for k, v in zip(KEY_ORDER, key_pos_weight.tolist())))
     else:

@@ -24,6 +24,12 @@ class DrivingNet(nn.Module):
                 "mouse_hidden_dim": 96,
                 "dropout": 0.25,
             },
+            "xl": {
+                "channels": (64, 128, 256, 384),
+                "shared_dim": 512,
+                "mouse_hidden_dim": 128,
+                "dropout": 0.30,
+            },
         }
         if model_size not in specs:
             raise ValueError(f"model_size invalido: {model_size}. Opciones: {sorted(specs)}")
